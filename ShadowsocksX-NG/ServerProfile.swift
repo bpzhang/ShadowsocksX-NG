@@ -11,17 +11,17 @@ import Cocoa
 
 class ServerProfile: NSObject, NSCopying {
     
-    var uuid: String
+    @objc var uuid: String
 
-    var serverHost: String = ""
-    var serverPort: uint16 = 8379
-    var method:String = "aes-128-gcm"
-    var password:String = ""
-    var remark:String = ""
-    var ota: Bool = false // onetime authentication
+    @objc var serverHost: String = ""
+    @objc var serverPort: uint16 = 8379
+    @objc var method:String = "aes-128-gcm"
+    @objc var password:String = ""
+    @objc var remark:String = ""
+    @objc var ota: Bool = false // onetime authentication
     
-    var enabledKcptun: Bool = false
-    var kcptunProfile = KcptunProfile()
+    @objc var enabledKcptun: Bool = false
+    @objc var kcptunProfile = KcptunProfile()
     
     override init() {
         uuid = UUID().uuidString
@@ -31,7 +31,7 @@ class ServerProfile: NSObject, NSCopying {
         self.uuid = uuid
     }
 
-    convenience init?(url: URL?) {
+    convenience init?(url: URL) {
         self.init()
 
         func padBase64(string: String) -> String {
@@ -44,14 +44,12 @@ class ServerProfile: NSObject, NSCopying {
             }
         }
 
-        func decodeUrl(url: URL?) -> String? {
-            guard let urlStr = url?.absoluteString else {
-                return nil
-            }
+        func decodeUrl(url: URL) -> String? {
+            let urlStr = url.absoluteString
             let index = urlStr.index(urlStr.startIndex, offsetBy: 5)
-            let encodedStr = urlStr.substring(from: index)
-            guard let data = Data(base64Encoded: padBase64(string: encodedStr)) else {
-                return url?.absoluteString
+            let encodedStr = urlStr[index...]
+            guard let data = Data(base64Encoded: padBase64(string: String(encodedStr))) else {
+                return url.absoluteString
             }
             guard let decoded = String(data: data, encoding: String.Encoding.utf8) else {
                 return nil
@@ -67,17 +65,40 @@ class ServerProfile: NSObject, NSCopying {
             return nil
         }
         guard let host = parsedUrl.host, let port = parsedUrl.port,
-            let method = parsedUrl.user, let password = parsedUrl.password else {
+            let user = parsedUrl.user else {
             return nil
         }
 
         self.serverHost = host
         self.serverPort = UInt16(port)
-        self.method = method.lowercased()
-        self.password = password
 
+        // This can be overriden by the fragment part of SIP002 URL
         remark = parsedUrl.queryItems?
             .filter({ $0.name == "Remark" }).first?.value ?? ""
+
+        if let password = parsedUrl.password {
+            self.method = user.lowercased()
+            self.password = password
+        } else {
+            // SIP002 URL have no password section
+            guard let data = Data(base64Encoded: padBase64(string: user)),
+                let userInfo = String(data: data, encoding: .utf8) else {
+                return nil
+            }
+
+            let parts = userInfo.characters.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count != 2 {
+                return nil
+            }
+            self.method = String(parts[0]).lowercased()
+            self.password = String(parts[1])
+
+            // SIP002 defines where to put the profile name
+            if let profileName = parsedUrl.fragment {
+                self.remark = profileName
+            }
+        }
+
         if let otaStr = parsedUrl.queryItems?
             .filter({ $0.name == "OTA" }).first?.value {
             ota = NSString(string: otaStr).boolValue
@@ -182,7 +203,12 @@ class ServerProfile: NSObject, NSCopying {
     
     func toKcptunJsonConfig() -> [String: AnyObject] {
         var conf = kcptunProfile.toJsonConfig()
-        conf["remoteaddr"] = "\(serverHost):\(serverPort)" as AnyObject
+        if serverHost.contains(Character(":")) {
+            conf["remoteaddr"] = "[\(serverHost)]:\(serverPort)" as AnyObject
+        } else {
+            conf["remoteaddr"] = "\(serverHost):\(serverPort)" as AnyObject
+        }
+
         return conf
     }
 
@@ -225,7 +251,7 @@ class ServerProfile: NSObject, NSCopying {
         return true
     }
 
-    func URL() -> Foundation.URL? {
+    private func makeLegacyURL() -> URL? {
         var url = URLComponents()
 
         url.host = serverHost
@@ -254,6 +280,39 @@ class ServerProfile: NSObject, NSCopying {
         }
         return nil
     }
+
+    func URL(legacy: Bool = false) -> URL? {
+        // If you want the URL from <= 1.5.1
+        if (legacy) {
+            return self.makeLegacyURL()
+        }
+
+        guard let rawUserInfo = "\(method):\(password)".data(using: .utf8) else {
+            return nil
+        }
+        let paddings = CharacterSet(charactersIn: "=")
+        let userInfo = rawUserInfo.base64EncodedString().trimmingCharacters(in: paddings)
+
+        var items = [URLQueryItem(name: "OTA", value: ota.description)]
+        if enabledKcptun {
+            items.append(URLQueryItem(name: "Kcptun", value: enabledKcptun.description))
+            items.append(contentsOf: kcptunProfile.urlQueryItems())
+        }
+
+        var comps = URLComponents()
+
+        comps.scheme = "ss"
+        comps.host = serverHost
+        comps.port = Int(serverPort)
+        comps.user = userInfo
+        comps.path = "/"  // This is required by SIP0002 for URLs with fragment or query
+        comps.fragment = remark
+        comps.queryItems = items
+
+        let url = try? comps.asURL()
+
+        return url
+    }
     
     func title() -> String {
         if remark.isEmpty {
@@ -262,4 +321,5 @@ class ServerProfile: NSObject, NSCopying {
             return "\(remark) (\(serverHost):\(serverPort))"
         }
     }
+    
 }
